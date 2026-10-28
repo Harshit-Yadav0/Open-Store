@@ -1,0 +1,14 @@
+{
+  "name": "open-store",
+  "version": "1.0.0",
+  "description": "Open Store - a 90s style web app store with studio and master admin panels",
+  "main": "server.js",
+  "private": true,
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning server.js"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "license": "UNLICENSED"
+}
