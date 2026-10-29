@@ -32,7 +32,7 @@ function iconHtml(icon) {
   return `<span class="icon" aria-hidden="true">${esc(icon || '📦')}</span>`;
 }
 function win(title, inner) {
-  return `<section class="win"><div class="title"><span>${esc(title)}</span><span class="x" aria-hidden="true">x</span></div><div class="body">${inner}</div></section>`;
+  return `<section class="win"><div class="title"><span>${esc(title)}</span></div><div class="body">${inner}</div></section>`;
 }
 function setMsg(id, text, kind = 'err') {
   const el = document.getElementById(id);
@@ -53,17 +53,16 @@ function shell(inner, route) {
     links.push(`<a href="#/login" class="${route === 'login' ? 'on' : ''}">Studio Login</a>`);
   }
   return `
-  <div class="marquee-bar"><marquee scrollamount="6">*** WELCOME TO OPEN STORE *** FREE APPS FROM INDEPENDENT STUDIOS *** CLICK INSTALL AND GO *** SIGN THE GUESTBOOK (JUST KIDDING) ***</marquee></div>
-  <header class="logo"><h1>OPEN STORE</h1><div class="sub">The <span class="blink">NEW</span> place to get apps!</div></header>
-  <nav class="win" aria-label="Main"><div class="nav">${links.join('')}</div></nav>
+  <div class="topbar"><span class="status"><i class="dot"></i>System online</span><span>${num(state.stats.apps)} apps</span><span class="hide-sm">${num(state.stats.installs)} installs logged</span></div>
+  <header class="brand">
+    <a href="#/" class="mark" aria-label="Open Store home"><span class="ring"></span><span class="word">Open<b>Store</b></span></a>
+    <nav class="nav" aria-label="Main">${links.join('')}</nav>
+  </header>
   <main>${inner}</main>
-  <footer class="win"><div class="body footer">
-    <div>You are visitor number ${counterHtml(state.stats.visits)}</div>
-    <div class="construction"><span>UNDER CONSTRUCTION</span></div>
-    <div>${num(state.stats.apps)} apps | ${num(state.stats.installs)} installs | ${num(state.stats.visitors)} visitors</div>
-    <div>Best viewed with Netscape Navigator at 800x600. &copy; 1997-2026 Open Store.</div>
-    <div>Apps are made and hosted by independent studios. Found something that is yours? The master admin removes it.</div>
-  </div></footer>`;
+  <footer class="footer">
+    <div><p>Apps are made and hosted by independent studios. Found something that is yours? The master admin removes it.</p><p>&copy; 2026 Open Store</p></div>
+    <div>Visits${counterHtml(state.stats.visits)}</div>
+  </footer>`;
 }
 function draw(inner, route) { root.innerHTML = shell(inner, route); window.scrollTo(0, 0); }
 
@@ -85,7 +84,17 @@ function appCard(a) {
 
 async function viewHome() {
   const cats = state.categories.map((c) => `<option>${esc(c)}</option>`).join('');
-  draw(win('Find Apps', `
+  const s = state.stats;
+  draw(`<section class="hero">
+      <p class="eyebrow">Independent studios // open distribution</p>
+      <h2>Find an app. <em>Install it in one tap.</em></h2>
+      <p class="lede">Every app on Open Store comes straight from the studio that built it. No middle layer, no account needed.</p>
+      <div class="readouts">
+        <div class="readout"><b>${num(s.apps)}</b><span>apps live</span></div>
+        <div class="readout"><b>${num(s.installs)}</b><span>installs</span></div>
+        <div class="readout"><b>${num(s.visitors)}</b><span>visitors</span></div>
+      </div>
+    </section>` + win('Find Apps', `
     <form id="search" class="searchbar" data-form="search" role="search">
       <input type="search" id="q" name="q" placeholder="Search apps or studios..." aria-label="Search">
       <select id="cat" name="category" aria-label="Category"><option value="">All categories</option>${cats}</select>
