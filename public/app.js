@@ -14,6 +14,9 @@ const state = {
   edit: null,          // app being edited in a form
   masterTab: 'overview',
   cache: { apps: [], admins: [] },
+  ads: [],
+  seen: new Set(),
+  route: '',
 };
 
 async function api(method, url, body) {
@@ -53,18 +56,59 @@ function shell(inner, route) {
     links.push(`<a href="#/login" class="${route === 'login' ? 'on' : ''}">Studio Login</a>`);
   }
   return `
+  <aside class="rail left" id="railL" aria-label="Sponsored"></aside>
+  <aside class="rail right" id="railR" aria-label="Sponsored"></aside>
   <div class="topbar"><span class="status"><i class="dot"></i>System online</span><span>${num(state.stats.apps)} apps</span><span class="hide-sm">${num(state.stats.installs)} installs logged</span></div>
   <header class="brand">
     <a href="#/" class="mark" aria-label="Open Store home"><span class="ring"></span><span class="word">Open<b>Store</b></span></a>
     <nav class="nav" aria-label="Main">${links.join('')}</nav>
   </header>
   <main>${inner}</main>
+  <aside class="adstrip" id="adstrip" aria-label="Sponsored"></aside>
   <footer class="footer">
     <div><p>Apps are made and hosted by independent studios. Found something that is yours? The master admin removes it.</p><p>&copy; 2026 Open Store</p></div>
     <div>Visits${counterHtml(state.stats.visits)}</div>
   </footer>`;
 }
-function draw(inner, route) { root.innerHTML = shell(inner, route); window.scrollTo(0, 0); }
+function draw(inner, route) {
+  root.innerHTML = shell(inner, route);
+  state.route = route;
+  showAds();
+  window.scrollTo(0, 0);
+}
+
+/* ------------------------------------------------------------------- ads */
+/* Side billboards: shown only on public pages (home + app pages), never on admin pages.
+   Wide screens: two rails in the side margins. Narrower screens: one slim row above the footer. */
+const wideMq = window.matchMedia('(min-width: 1400px)');
+function adHtml(a) {
+  const art = a.image_url
+    ? `<img src="${esc(a.image_url)}" alt="" loading="lazy" referrerpolicy="no-referrer">`
+    : `<span class="adtxt">${esc(a.advertiser)}</span>`;
+  return `<a class="ad" href="/ad/${a.id}" target="_blank" rel="sponsored noopener noreferrer">
+    <span class="adlabel">Sponsored</span><span class="adart">${art}</span><span class="adtitle">${esc(a.title)}</span></a>`;
+}
+function showAds() {
+  const L = $('#railL'), R = $('#railR'), S = $('#adstrip');
+  if (!L || !R || !S) return;
+  L.innerHTML = R.innerHTML = S.innerHTML = '';
+  if (state.route !== 'home' || !state.ads.length) return;
+  let shown;
+  if (wideMq.matches) {
+    shown = state.ads.slice(0, 4);
+    L.innerHTML = shown.filter((_, i) => i % 2 === 0).map(adHtml).join('');
+    R.innerHTML = shown.filter((_, i) => i % 2 === 1).map(adHtml).join('');
+  } else {
+    shown = state.ads.slice(0, 3);
+    S.innerHTML = shown.map(adHtml).join('');
+  }
+  const fresh = shown.filter((a) => !state.seen.has(a.id));
+  if (fresh.length) {
+    fresh.forEach((a) => state.seen.add(a.id));
+    api('POST', '/api/ads/seen', { ids: fresh.map((a) => a.id) }).catch(() => {});
+  }
+}
+if (wideMq.addEventListener) wideMq.addEventListener('change', showAds);
 
 /* -------------------------------------------------------------------- home */
 function appCard(a) {
@@ -222,7 +266,7 @@ async function viewStudio() {
 async function viewMaster() {
   if (!state.user) { location.hash = '#/login'; return; }
   if (state.user.role !== 'master') { location.hash = '#/studio'; return; }
-  const tabs = ['overview', 'studios', 'apps', 'strikes'];
+  const tabs = ['overview', 'studios', 'apps', 'ads', 'strikes'];
   const tabBar = `<div class="tabs" role="tablist">${tabs.map((t) => `<button role="tab" class="${state.masterTab === t ? 'on' : ''}" data-act="tab" data-tab="${t}">${t[0].toUpperCase() + t.slice(1)}</button>`).join('')}</div>`;
   let inner = '';
   try {
@@ -274,6 +318,26 @@ async function viewMaster() {
         win(`All apps (${apps.length})`, apps.length
           ? `<div class="scroll"><table><thead><tr><th>App</th><th>Studio</th><th>Status</th><th class="num">Installs</th><th class="num">Users</th><th>Actions</th></tr></thead><tbody>${rows}</tbody></table></div>`
           : '<div class="empty">No apps yet.</div>');
+    } else if (state.masterTab === 'ads') {
+      const { ads } = await api('GET', '/api/master/ads');
+      const rows = ads.map((a) => `<tr>
+        <td>${esc(a.title)}<br><span class="studio">${esc(a.advertiser)}</span></td>
+        <td>${a.status === 'active' ? '<span class="pill green">ACTIVE</span>' : '<span class="pill gray">PAUSED</span>'}</td>
+        <td class="num">${num(a.impressions)}</td><td class="num">${num(a.clicks)}</td>
+        <td class="num">${a.impressions ? ((a.clicks / a.impressions) * 100).toFixed(1) + '%' : '-'}</td>
+        <td><div class="acts">
+          ${a.status === 'active' ? `<button class="small" data-act="ad-pause" data-id="${a.id}">Pause</button>` : `<button class="small" data-act="ad-resume" data-id="${a.id}">Resume</button>`}
+          <button class="small danger" data-act="ad-del" data-id="${a.id}">Delete</button></div></td></tr>`).join('');
+      inner = win('Add a sponsored panel', `<form id="adform" data-form="ad">
+          <div class="row"><div><label for="ad_adv">Advertiser</label><input type="text" id="ad_adv" name="advertiser" maxlength="40" required></div>
+          <div><label for="ad_title">Headline</label><input type="text" id="ad_title" name="title" maxlength="60" required></div></div>
+          <label for="ad_img">Image link (optional, a tall or square picture works best)</label><input type="url" id="ad_img" name="image_url" maxlength="1000" placeholder="https://...">
+          <label for="ad_link">Click link (where the ad goes)</label><input type="url" id="ad_link" name="link_url" maxlength="1000" required placeholder="https://...">
+          <div id="admsg"></div><p><button type="submit">Add panel</button></p></form>
+          <p class="studio">Ads appear on the home and app pages only, always marked Sponsored, never as popups. Up to 4 show at a time on wide screens, 3 on smaller ones, picked at random.</p>`) +
+        win(`All ads (${ads.length})`, ads.length
+          ? `<div class="scroll"><table><thead><tr><th>Ad</th><th>Status</th><th class="num">Views</th><th class="num">Clicks</th><th class="num">CTR</th><th>Actions</th></tr></thead><tbody>${rows}</tbody></table></div>`
+          : '<div class="empty">No ads yet.</div>');
     } else {
       const { strikes } = await api('GET', '/api/master/strikes');
       const rows = strikes.map((s) => `<tr>
@@ -344,6 +408,14 @@ const formHandlers = {
       await reloadView();
     } catch (err) { setMsg('adminmsg', err.message); }
   },
+
+  async ad(e, form) {
+    e.preventDefault();
+    try {
+      await api('POST', '/api/master/ads', Object.fromEntries(new FormData(form)));
+      await reloadView();
+    } catch (err) { setMsg('admsg', err.message); }
+  },
 };
 
 const actions = {
@@ -394,6 +466,12 @@ const actions = {
     if (!confirm('Delete this studio AND all its apps for good?')) return;
     await run(() => api('DELETE', `/api/master/admins/${el.dataset.id}`));
   },
+  async 'ad-pause'(e, el) { await run(() => api('POST', `/api/master/ads/${el.dataset.id}/status`, { status: 'paused' })); },
+  async 'ad-resume'(e, el) { await run(() => api('POST', `/api/master/ads/${el.dataset.id}/status`, { status: 'active' })); },
+  async 'ad-del'(e, el) {
+    if (!confirm('Delete this ad for good?')) return;
+    await run(() => api('DELETE', `/api/master/ads/${el.dataset.id}`));
+  },
 };
 async function run(fn) {
   try { const r = await fn(); await reloadView(); return r; }
@@ -424,5 +502,6 @@ window.addEventListener('hashchange', router);
     state.user = me.user; state.categories = cats.categories;
     state.stats = await api('POST', '/api/visit');
   } catch { /* site still shows; individual calls report errors */ }
+  try { state.ads = (await api('GET', '/api/ads')).ads; } catch { state.ads = []; }
   router();
 })();
