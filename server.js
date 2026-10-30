@@ -1,33 +1,107 @@
 'use strict';
 /*
  * OPEN STORE server
- * Zero dependencies. Needs Node.js 22.5 or newer (built-in SQLite + crypto).
+ * Needs Node.js 22.5 or newer.
+ *
+ * Database:
+ *   - If TURSO_DATABASE_URL is set, data lives in your Turso database (safe across redeploys).
+ *     This needs the @libsql/client package (npm install).
+ *   - Otherwise data lives in a local SQLite file (fine for testing on your own computer,
+ *     but it is wiped on hosts with a temporary disk, like Render's free plan).
  *
  * Env vars:
- *   PORT          port to listen on (hosts like pxxl.app set this for you)
- *   MASTER_USER   master admin username   (default: master)
- *   MASTER_PASS   master admin password   (set this! min 8 chars)
- *   DB_PATH       sqlite file location     (default: ./data/openstore.db)
+ *   PORT                 port to listen on (hosts usually set this for you)
+ *   MASTER_USER          master admin username   (default: master)
+ *   MASTER_PASS          master admin password   (set this! min 8 chars)
+ *   TURSO_DATABASE_URL   libsql://your-db.turso.io
+ *   TURSO_AUTH_TOKEN     token from Turso
+ *   DB_PATH              local sqlite file (default: ./data/openstore.db), used when Turso is not set
  */
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { DatabaseSync } = require('node:sqlite');
 
 const PORT = Number(process.env.PORT) || 3000;
+const TURSO_URL = (process.env.TURSO_DATABASE_URL || process.env.TURSO_URL || '').trim();
+const TURSO_TOKEN = (process.env.TURSO_AUTH_TOKEN || process.env.TURSO_TOKEN || '').trim();
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'data', 'openstore.db');
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const CATEGORIES = ['Games', 'Tools', 'Social', 'Music', 'Photo', 'Education', 'Productivity', 'Other'];
 const MAX_STRIKES = 3;
 const SESSION_MS = 7 * 24 * 60 * 60 * 1000;
 
-/* ---------------------------------------------------------------- database */
-fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
-const db = new DatabaseSync(DB_PATH);
-db.exec(`
-  PRAGMA journal_mode = WAL;
-  PRAGMA foreign_keys = ON;
+/* ---------------------------------------------------------------- database
+ * One small interface over two backends, so the rest of the file does not care which one is in use:
+ *   all(sql, args)    -> array of plain row objects
+ *   get(sql, args)    -> first row or undefined
+ *   run(sql, args)    -> { changes, lastId }
+ *   batch([[sql, args], ...]) -> runs all statements as one all-or-nothing transaction
+ *   exec(script)      -> runs several statements (used for the schema)
+ */
+const norm = (v) => (typeof v === 'bigint' ? Number(v) : v);
+
+function openLocal(file) {
+  const { DatabaseSync } = require('node:sqlite');
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const d = new DatabaseSync(file);
+  d.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
+  const plain = (r) => { const o = {}; for (const k of Object.keys(r)) o[k] = norm(r[k]); return o; };
+  return {
+    kind: 'local',
+    async all(sql, args = []) { return d.prepare(sql).all(...args).map(plain); },
+    async get(sql, args = []) { const r = d.prepare(sql).get(...args); return r ? plain(r) : undefined; },
+    async run(sql, args = []) {
+      const r = d.prepare(sql).run(...args);
+      return { changes: Number(r.changes), lastId: Number(r.lastInsertRowid) };
+    },
+    async batch(stmts) { // no await inside, so nothing else can interleave
+      d.exec('BEGIN');
+      try {
+        for (const [sql, args = []] of stmts) d.prepare(sql).run(...args);
+        d.exec('COMMIT');
+      } catch (e) { d.exec('ROLLBACK'); throw e; }
+    },
+    async exec(script) { d.exec(script); },
+  };
+}
+
+async function loadLibsql() {
+  const names = ['@libsql/client', '@tursodatabase/serverless/compat'];
+  let lastErr;
+  for (const name of names) {
+    try {
+      let m;
+      try { m = require(name); } catch (e) { m = await import(name); }
+      const createClient = m.createClient || (m.default && m.default.createClient);
+      if (createClient) return createClient;
+    } catch (e) { lastErr = e; }
+  }
+  throw new Error('Turso is configured but its library is missing. Run "npm install" (package @libsql/client). ' + (lastErr ? lastErr.message : ''));
+}
+
+async function openTurso(url, authToken) {
+  const createClient = await loadLibsql();
+  const c = createClient(authToken ? { url, authToken } : { url });
+  const rowsOf = (r) => r.rows.map((row) => {
+    const o = {};
+    r.columns.forEach((col, i) => { o[col] = norm(row[i]); });
+    return o;
+  });
+  return {
+    kind: 'turso',
+    async all(sql, args = []) { return rowsOf(await c.execute({ sql, args })); },
+    async get(sql, args = []) { return rowsOf(await c.execute({ sql, args }))[0]; },
+    async run(sql, args = []) {
+      const r = await c.execute({ sql, args });
+      return { changes: Number(r.rowsAffected), lastId: r.lastInsertRowid == null ? 0 : Number(r.lastInsertRowid) };
+    },
+    async batch(stmts) { await c.batch(stmts.map(([sql, args = []]) => ({ sql, args })), 'write'); },
+    async exec(script) { await c.executeMultiple(script); },
+  };
+}
+
+const SCHEMA = `
   CREATE TABLE IF NOT EXISTS admins (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT NOT NULL UNIQUE,
@@ -41,12 +115,12 @@ db.exec(`
   );
   CREATE TABLE IF NOT EXISTS sessions (
     token_hash TEXT PRIMARY KEY,
-    admin_id INTEGER NOT NULL REFERENCES admins(id) ON DELETE CASCADE,
+    admin_id INTEGER NOT NULL,
     expires_at INTEGER NOT NULL
   );
   CREATE TABLE IF NOT EXISTS apps (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    admin_id INTEGER NOT NULL REFERENCES admins(id) ON DELETE CASCADE,
+    admin_id INTEGER NOT NULL,
     name TEXT NOT NULL,
     tagline TEXT NOT NULL DEFAULT '',
     description TEXT NOT NULL DEFAULT '',
@@ -61,7 +135,7 @@ db.exec(`
   );
   CREATE TABLE IF NOT EXISTS installs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    app_id INTEGER NOT NULL REFERENCES apps(id) ON DELETE CASCADE,
+    app_id INTEGER NOT NULL,
     vid TEXT NOT NULL,
     created_at INTEGER NOT NULL
   );
@@ -93,7 +167,9 @@ db.exec(`
     clicks INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL
   );
-`);
+`;
+
+let db; // set in start()
 
 /* ----------------------------------------------------------------- helpers */
 class HttpError extends Error {
@@ -217,15 +293,15 @@ function readBody(req) {
 }
 
 /* -------------------------------------------------------------------- auth */
-function currentUser(req) {
+async function currentUser(req) {
   const tok = parseCookies(req).os_sid;
   if (!tok) return null;
-  const row = db.prepare(`
+  const row = await db.get(`
     SELECT a.id, a.username, a.display_name, a.role, a.status, a.strikes, s.expires_at
-    FROM sessions s JOIN admins a ON a.id = s.admin_id WHERE s.token_hash = ?`).get(sha(tok));
+    FROM sessions s JOIN admins a ON a.id = s.admin_id WHERE s.token_hash = ?`, [sha(tok)]);
   if (!row) return null;
   if (row.expires_at < now() || row.status !== 'active') {
-    db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(sha(tok));
+    await db.run('DELETE FROM sessions WHERE token_hash = ?', [sha(tok)]);
     return null;
   }
   return row;
@@ -241,10 +317,6 @@ function noteFailure(key) {
   if (!rec || rec.reset < now()) attempts.set(key, { n: 1, reset: now() + 15 * 60 * 1000 });
   else rec.n++;
 }
-setInterval(() => {
-  for (const [k, v] of attempts) if (v.reset < now()) attempts.delete(k);
-  db.prepare('DELETE FROM sessions WHERE expires_at < ?').run(now());
-}, 10 * 60 * 1000).unref();
 
 function getVid(req, res) {
   let vid = parseCookies(req).os_vid;
@@ -277,6 +349,12 @@ function ownerOrMaster(user, appRow) {
   if (!appRow) throw new HttpError(404, 'App not found');
   if (user.role !== 'master' && appRow.admin_id !== user.id) throw new HttpError(403, 'Not your app');
 }
+async function deleteApp(id) {
+  await db.batch([
+    ['DELETE FROM installs WHERE app_id = ?', [id]],
+    ['DELETE FROM apps WHERE id = ?', [id]],
+  ]);
+}
 
 /* ------------------------------------------------------------------ routes */
 const routes = [];
@@ -289,67 +367,71 @@ function route(method, pattern, auth, handler) {
 /* ---- public */
 route('GET', '/api/categories', null, () => ({ categories: CATEGORIES }));
 
-route('POST', '/api/visit', null, ({ req, res }) => {
+async function publicStats() {
+  const r = await db.get(`
+    SELECT (SELECT COUNT(*) FROM visitors) AS visitors,
+           (SELECT COALESCE(SUM(visits), 0) FROM visitors) AS visits,
+           (SELECT COUNT(*) FROM apps a JOIN admins ad ON ad.id = a.admin_id WHERE ${PUBLIC_WHERE}) AS apps,
+           (SELECT COUNT(*) FROM installs) AS installs`);
+  return { visits: r.visits, visitors: r.visitors, apps: r.apps, installs: r.installs };
+}
+route('POST', '/api/visit', null, async ({ req, res }) => {
   const vid = getVid(req, res);
   const t = now();
-  const row = db.prepare('SELECT vid FROM visitors WHERE vid = ?').get(vid);
-  if (row) db.prepare('UPDATE visitors SET visits = visits + 1, last_seen = ? WHERE vid = ?').run(t, vid);
-  else db.prepare('INSERT INTO visitors (vid, first_seen, last_seen) VALUES (?, ?, ?)').run(vid, t, t);
+  const r = await db.run('UPDATE visitors SET visits = visits + 1, last_seen = ? WHERE vid = ?', [t, vid]);
+  if (!r.changes) await db.run('INSERT OR IGNORE INTO visitors (vid, visits, first_seen, last_seen) VALUES (?, 1, ?, ?)', [vid, t, t]);
   return publicStats();
 });
-function publicStats() {
-  const v = db.prepare('SELECT COUNT(*) AS unique_visitors, COALESCE(SUM(visits),0) AS visits FROM visitors').get();
-  const a = db.prepare(`SELECT COUNT(*) AS n FROM apps a JOIN admins ad ON ad.id = a.admin_id WHERE ${PUBLIC_WHERE}`).get();
-  const i = db.prepare('SELECT COUNT(*) AS n FROM installs').get();
-  return { visits: v.visits, visitors: v.unique_visitors, apps: a.n, installs: i.n };
-}
 route('GET', '/api/stats', null, () => publicStats());
 
-route('GET', '/api/apps', null, ({ query }) => {
-  const where = [PUBLIC_WHERE]; const params = [];
+route('GET', '/api/apps', null, async ({ query }) => {
+  const where = [PUBLIC_WHERE]; const args = [];
   const q = String(query.get('q') || '').trim().slice(0, 60);
   if (q) {
     const like = '%' + q.replace(/[\\%_]/g, (c) => '\\' + c) + '%';
     where.push(`(a.name LIKE ? ESCAPE '\\' OR a.tagline LIKE ? ESCAPE '\\' OR ad.display_name LIKE ? ESCAPE '\\')`);
-    params.push(like, like, like);
+    args.push(like, like, like);
   }
   const cat = String(query.get('category') || '');
-  if (cat && CATEGORIES.includes(cat)) { where.push('a.category = ?'); params.push(cat); }
+  if (cat && CATEGORIES.includes(cat)) { where.push('a.category = ?'); args.push(cat); }
   const order = query.get('sort') === 'new' ? 'a.created_at DESC' : 'installs DESC, a.created_at DESC';
-  const rows = db.prepare(`${APP_SELECT} WHERE ${where.join(' AND ')} ORDER BY ${order} LIMIT 200`).all(...params);
+  const rows = await db.all(`${APP_SELECT} WHERE ${where.join(' AND ')} ORDER BY ${order} LIMIT 200`, args);
   return { apps: rows.map((r) => publicApp(r, false)) };
 });
 
-route('GET', '/api/apps/:id', null, ({ params }) => {
-  const r = db.prepare(`${APP_SELECT} WHERE a.id = ? AND ${PUBLIC_WHERE}`).get(Number(params.id));
+route('GET', '/api/apps/:id', null, async ({ params }) => {
+  const r = await db.get(`${APP_SELECT} WHERE a.id = ? AND ${PUBLIC_WHERE}`, [Number(params.id)]);
   if (!r) throw new HttpError(404, 'App not found');
   return { app: publicApp(r, true) };
 });
 
 /* install click: count it, then send the visitor to the app file link */
-route('GET', '/go/:id', null, ({ req, res, params }) => {
-  const r = db.prepare(`${APP_SELECT} WHERE a.id = ? AND ${PUBLIC_WHERE}`).get(Number(params.id));
+route('GET', '/go/:id', null, async ({ req, res, params }) => {
+  const r = await db.get(`${APP_SELECT} WHERE a.id = ? AND ${PUBLIC_WHERE}`, [Number(params.id)]);
   if (!r) throw new HttpError(404, 'App not available');
   const vid = getVid(req, res);
-  db.prepare('INSERT INTO installs (app_id, vid, created_at) VALUES (?, ?, ?)').run(r.id, vid, now());
-  return { __redirect: cleanUrl(r.file_url, 'App file link') };
+  const target = cleanUrl(r.file_url, 'App file link');
+  await db.run('INSERT INTO installs (app_id, vid, created_at) VALUES (?, ?, ?)', [r.id, vid, now()]);
+  return { __redirect: target };
 });
 
 /* ---- ads (side billboards) */
-route('GET', '/api/ads', null, () => ({
-  ads: db.prepare("SELECT id, advertiser, title, image_url FROM ads WHERE status = 'active' ORDER BY RANDOM() LIMIT 6").all(),
+route('GET', '/api/ads', null, async () => ({
+  ads: await db.all("SELECT id, advertiser, title, image_url FROM ads WHERE status = 'active' ORDER BY RANDOM() LIMIT 6"),
 }));
-route('POST', '/api/ads/seen', null, ({ body }) => {
+route('POST', '/api/ads/seen', null, async ({ body }) => {
   const ids = Array.isArray(body.ids) ? body.ids.slice(0, 6).map(Number).filter(Number.isInteger) : [];
-  const st = db.prepare("UPDATE ads SET impressions = impressions + 1 WHERE id = ? AND status = 'active'");
-  for (const id of ids) st.run(id);
+  if (ids.length) {
+    await db.batch(ids.map((id) => ["UPDATE ads SET impressions = impressions + 1 WHERE id = ? AND status = 'active'", [id]]));
+  }
   return { ok: true };
 });
-route('GET', '/ad/:id', null, ({ params }) => {
-  const a = db.prepare("SELECT * FROM ads WHERE id = ? AND status = 'active'").get(Number(params.id));
+route('GET', '/ad/:id', null, async ({ params }) => {
+  const a = await db.get("SELECT * FROM ads WHERE id = ? AND status = 'active'", [Number(params.id)]);
   if (!a) throw new HttpError(404, 'Ad not available');
-  db.prepare('UPDATE ads SET clicks = clicks + 1 WHERE id = ?').run(a.id);
-  return { __redirect: cleanUrl(a.link_url, 'Ad link') };
+  const target = cleanUrl(a.link_url, 'Ad link');
+  await db.run('UPDATE ads SET clicks = clicks + 1 WHERE id = ?', [a.id]);
+  return { __redirect: target };
 });
 
 /* ---- login */
@@ -358,18 +440,18 @@ route('POST', '/api/login', null, async ({ req, res, body }) => {
   const password = String(body.password || '').slice(0, 200);
   const ipKey = 'ip:' + clientIp(req); const userKey = 'u:' + username;
   if (tooManyAttempts(ipKey) || tooManyAttempts(userKey)) throw new HttpError(429, 'Too many tries. Wait 15 minutes.');
-  const admin = db.prepare('SELECT * FROM admins WHERE username = ?').get(username);
+  const admin = await db.get('SELECT * FROM admins WHERE username = ?', [username]);
   const ok = verifyPassword(password, admin ? admin.password_hash : DUMMY_HASH) && admin;
   if (!ok) { noteFailure(ipKey); noteFailure(userKey); throw new HttpError(401, 'Wrong username or password'); }
   if (admin.status !== 'active') throw new HttpError(403, `This studio is banned. Reason: ${admin.ban_reason || 'not given'}`);
   const token = crypto.randomBytes(32).toString('hex');
-  db.prepare('INSERT INTO sessions (token_hash, admin_id, expires_at) VALUES (?, ?, ?)').run(sha(token), admin.id, now() + SESSION_MS);
+  await db.run('INSERT INTO sessions (token_hash, admin_id, expires_at) VALUES (?, ?, ?)', [sha(token), admin.id, now() + SESSION_MS]);
   setCookie(req, res, 'os_sid', token, { maxAge: SESSION_MS });
   return { user: { id: admin.id, username: admin.username, display_name: admin.display_name, role: admin.role, strikes: admin.strikes } };
 });
-route('POST', '/api/logout', null, ({ req, res }) => {
+route('POST', '/api/logout', null, async ({ req, res }) => {
   const tok = parseCookies(req).os_sid;
-  if (tok) db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(sha(tok));
+  if (tok) await db.run('DELETE FROM sessions WHERE token_hash = ?', [sha(tok)]);
   setCookie(req, res, 'os_sid', '', { maxAge: 0 });
   return { ok: true };
 });
@@ -378,173 +460,178 @@ route('GET', '/api/me', null, ({ user }) => ({
 }));
 
 /* ---- studio (admin or master) */
-route('POST', '/api/me/password', 'admin', ({ user, body }) => {
-  const row = db.prepare('SELECT password_hash FROM admins WHERE id = ?').get(user.id);
+route('POST', '/api/me/password', 'admin', async ({ user, body }) => {
+  const row = await db.get('SELECT password_hash FROM admins WHERE id = ?', [user.id]);
   if (!verifyPassword(String(body.current || ''), row.password_hash)) throw new HttpError(400, 'Current password is wrong');
-  db.prepare('UPDATE admins SET password_hash = ? WHERE id = ?').run(hashPassword(cleanPassword(body.next)), user.id);
+  await db.run('UPDATE admins SET password_hash = ? WHERE id = ?', [hashPassword(cleanPassword(body.next)), user.id]);
   return { ok: true };
 });
 
-route('GET', '/api/my/apps', 'admin', ({ user }) => {
-  const rows = db.prepare(`${APP_SELECT} WHERE a.admin_id = ? ORDER BY a.created_at DESC`).all(user.id);
-  return { apps: rows };
-});
-route('POST', '/api/my/apps', 'admin', ({ user, body }) => {
+route('GET', '/api/my/apps', 'admin', async ({ user }) => ({
+  apps: await db.all(`${APP_SELECT} WHERE a.admin_id = ? ORDER BY a.created_at DESC`, [user.id]),
+}));
+route('POST', '/api/my/apps', 'admin', async ({ user, body }) => {
   const f = appFields(body); const t = now();
-  const r = db.prepare(`INSERT INTO apps (admin_id, name, tagline, description, category, version, icon, file_url, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(user.id, f.name, f.tagline, f.description, f.category, f.version, f.icon, f.file_url, t, t);
-  return { id: Number(r.lastInsertRowid) };
+  const r = await db.run(`INSERT INTO apps (admin_id, name, tagline, description, category, version, icon, file_url, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [user.id, f.name, f.tagline, f.description, f.category, f.version, f.icon, f.file_url, t, t]);
+  return { id: r.lastId };
 });
-route('PUT', '/api/my/apps/:id', 'admin', ({ user, params, body }) => {
-  const a = db.prepare('SELECT * FROM apps WHERE id = ?').get(Number(params.id));
+route('PUT', '/api/my/apps/:id', 'admin', async ({ user, params, body }) => {
+  const a = await db.get('SELECT * FROM apps WHERE id = ?', [Number(params.id)]);
   ownerOrMaster(user, a);
   const f = appFields(body);
-  db.prepare(`UPDATE apps SET name=?, tagline=?, description=?, category=?, version=?, icon=?, file_url=?, updated_at=? WHERE id=?`)
-    .run(f.name, f.tagline, f.description, f.category, f.version, f.icon, f.file_url, now(), a.id);
+  await db.run(`UPDATE apps SET name=?, tagline=?, description=?, category=?, version=?, icon=?, file_url=?, updated_at=? WHERE id=?`,
+    [f.name, f.tagline, f.description, f.category, f.version, f.icon, f.file_url, now(), a.id]);
   return { ok: true };
 });
-route('DELETE', '/api/my/apps/:id', 'admin', ({ user, params }) => {
-  const a = db.prepare('SELECT * FROM apps WHERE id = ?').get(Number(params.id));
+route('DELETE', '/api/my/apps/:id', 'admin', async ({ user, params }) => {
+  const a = await db.get('SELECT * FROM apps WHERE id = ?', [Number(params.id)]);
   ownerOrMaster(user, a);
-  db.prepare('DELETE FROM apps WHERE id = ?').run(a.id);
+  await deleteApp(a.id);
   return { ok: true };
 });
 
 /* ---- master only */
-route('GET', '/api/master/overview', 'master', () => {
-  const one = (sql) => db.prepare(sql).get().n;
-  return {
-    ...publicStats(),
-    all_apps: one('SELECT COUNT(*) AS n FROM apps'),
-    taken_down: one("SELECT COUNT(*) AS n FROM apps WHERE status <> 'live'"),
-    studios: one("SELECT COUNT(*) AS n FROM admins WHERE role = 'admin'"),
-    banned: one("SELECT COUNT(*) AS n FROM admins WHERE status = 'banned'"),
-    active_strikes: one('SELECT COUNT(*) AS n FROM strikes WHERE revoked = 0'),
-  };
+route('GET', '/api/master/overview', 'master', async () => {
+  const o = await db.get(`
+    SELECT (SELECT COUNT(*) FROM apps) AS all_apps,
+           (SELECT COUNT(*) FROM apps WHERE status <> 'live') AS taken_down,
+           (SELECT COUNT(*) FROM admins WHERE role = 'admin') AS studios,
+           (SELECT COUNT(*) FROM admins WHERE status = 'banned') AS banned,
+           (SELECT COUNT(*) FROM strikes WHERE revoked = 0) AS active_strikes`);
+  return { ...(await publicStats()), ...o };
 });
 
-route('GET', '/api/master/admins', 'master', () => {
-  const rows = db.prepare(`
+route('GET', '/api/master/admins', 'master', async () => ({
+  admins: await db.all(`
     SELECT a.id, a.username, a.display_name, a.role, a.status, a.ban_reason, a.strikes, a.created_at,
       (SELECT COUNT(*) FROM apps p WHERE p.admin_id = a.id) AS apps,
       (SELECT COUNT(*) FROM installs i JOIN apps p ON p.id = i.app_id WHERE p.admin_id = a.id) AS installs
-    FROM admins a ORDER BY a.role DESC, a.created_at DESC`).all();
-  return { admins: rows };
-});
-route('POST', '/api/master/admins', 'master', ({ body }) => {
+    FROM admins a ORDER BY a.role DESC, a.created_at DESC`),
+}));
+route('POST', '/api/master/admins', 'master', async ({ body }) => {
   const username = cleanUsername(body.username);
   const display = text(body.display_name, 'Studio name', 2, 40);
   const hash = hashPassword(cleanPassword(body.password));
-  if (db.prepare('SELECT id FROM admins WHERE username = ?').get(username)) throw new HttpError(409, 'Username already taken');
-  const r = db.prepare(`INSERT INTO admins (username, display_name, password_hash, role, created_at) VALUES (?, ?, ?, 'admin', ?)`)
-    .run(username, display, hash, now());
-  return { id: Number(r.lastInsertRowid) };
+  if (await db.get('SELECT id FROM admins WHERE username = ?', [username])) throw new HttpError(409, 'Username already taken');
+  const r = await db.run(`INSERT INTO admins (username, display_name, password_hash, role, created_at) VALUES (?, ?, ?, 'admin', ?)`,
+    [username, display, hash, now()]);
+  return { id: r.lastId };
 });
-function targetAdmin(id) {
-  const a = db.prepare('SELECT * FROM admins WHERE id = ?').get(Number(id));
+async function targetAdmin(id) {
+  const a = await db.get('SELECT * FROM admins WHERE id = ?', [Number(id)]);
   if (!a) throw new HttpError(404, 'Studio not found');
   if (a.role === 'master') throw new HttpError(400, 'That is the master account');
   return a;
 }
-function banAdmin(id, reason) {
-  db.prepare("UPDATE admins SET status = 'banned', ban_reason = ? WHERE id = ?").run(reason, id);
-  db.prepare('DELETE FROM sessions WHERE admin_id = ?').run(id);
+async function banAdmin(id, reason) {
+  await db.batch([
+    ["UPDATE admins SET status = 'banned', ban_reason = ? WHERE id = ?", [reason, id]],
+    ['DELETE FROM sessions WHERE admin_id = ?', [id]],
+  ]);
 }
-route('POST', '/api/master/admins/:id/ban', 'master', ({ params, body }) => {
-  const a = targetAdmin(params.id);
-  banAdmin(a.id, text(body.reason, 'Reason', 3, 300));
+route('POST', '/api/master/admins/:id/ban', 'master', async ({ params, body }) => {
+  const a = await targetAdmin(params.id);
+  await banAdmin(a.id, text(body.reason, 'Reason', 3, 300));
   return { ok: true };
 });
-route('POST', '/api/master/admins/:id/unban', 'master', ({ params }) => {
-  const a = targetAdmin(params.id);
-  db.prepare("UPDATE admins SET status = 'active', ban_reason = NULL WHERE id = ?").run(a.id);
+route('POST', '/api/master/admins/:id/unban', 'master', async ({ params }) => {
+  const a = await targetAdmin(params.id);
+  await db.run("UPDATE admins SET status = 'active', ban_reason = NULL WHERE id = ?", [a.id]);
   return { ok: true };
 });
-route('POST', '/api/master/admins/:id/password', 'master', ({ params, body }) => {
-  const a = targetAdmin(params.id);
-  db.prepare('UPDATE admins SET password_hash = ? WHERE id = ?').run(hashPassword(cleanPassword(body.password)), a.id);
-  db.prepare('DELETE FROM sessions WHERE admin_id = ?').run(a.id);
+route('POST', '/api/master/admins/:id/password', 'master', async ({ params, body }) => {
+  const a = await targetAdmin(params.id);
+  await db.batch([
+    ['UPDATE admins SET password_hash = ? WHERE id = ?', [hashPassword(cleanPassword(body.password)), a.id]],
+    ['DELETE FROM sessions WHERE admin_id = ?', [a.id]],
+  ]);
   return { ok: true };
 });
-route('DELETE', '/api/master/admins/:id', 'master', ({ params }) => {
-  const a = targetAdmin(params.id);
-  db.prepare('DELETE FROM admins WHERE id = ?').run(a.id);
+route('DELETE', '/api/master/admins/:id', 'master', async ({ params }) => {
+  const a = await targetAdmin(params.id);
+  await db.batch([
+    ['DELETE FROM sessions WHERE admin_id = ?', [a.id]],
+    ['DELETE FROM installs WHERE app_id IN (SELECT id FROM apps WHERE admin_id = ?)', [a.id]],
+    ['DELETE FROM apps WHERE admin_id = ?', [a.id]],
+    ['DELETE FROM admins WHERE id = ?', [a.id]],
+  ]);
   return { ok: true };
 });
 
-route('GET', '/api/master/apps', 'master', () => ({
-  apps: db.prepare(`${APP_SELECT} ORDER BY a.created_at DESC`).all(),
+route('GET', '/api/master/apps', 'master', async () => ({
+  apps: await db.all(`${APP_SELECT} ORDER BY a.created_at DESC`),
 }));
-route('POST', '/api/master/apps', 'master', ({ user, body }) => {
+route('POST', '/api/master/apps', 'master', async ({ user, body }) => {
   const owner = body.admin_id ? Number(body.admin_id) : user.id;
-  const adm = db.prepare('SELECT id, status FROM admins WHERE id = ?').get(owner);
+  const adm = await db.get('SELECT id, status FROM admins WHERE id = ?', [owner]);
   if (!adm) throw new HttpError(404, 'Studio not found');
   const f = appFields(body); const t = now();
-  const r = db.prepare(`INSERT INTO apps (admin_id, name, tagline, description, category, version, icon, file_url, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(owner, f.name, f.tagline, f.description, f.category, f.version, f.icon, f.file_url, t, t);
-  return { id: Number(r.lastInsertRowid) };
+  const r = await db.run(`INSERT INTO apps (admin_id, name, tagline, description, category, version, icon, file_url, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [owner, f.name, f.tagline, f.description, f.category, f.version, f.icon, f.file_url, t, t]);
+  return { id: r.lastId };
 });
-route('POST', '/api/master/apps/:id/status', 'master', ({ params, body }) => {
+route('POST', '/api/master/apps/:id/status', 'master', async ({ params, body }) => {
   const status = body.status === 'live' ? 'live' : 'taken_down';
-  const r = db.prepare('UPDATE apps SET status = ?, updated_at = ? WHERE id = ?').run(status, now(), Number(params.id));
+  const r = await db.run('UPDATE apps SET status = ?, updated_at = ? WHERE id = ?', [status, now(), Number(params.id)]);
   if (!r.changes) throw new HttpError(404, 'App not found');
   return { ok: true };
 });
-route('POST', '/api/master/apps/:id/strike', 'master', ({ params, body }) => {
-  const a = db.prepare(`SELECT a.*, ad.display_name AS studio, ad.role AS role FROM apps a JOIN admins ad ON ad.id = a.admin_id WHERE a.id = ?`).get(Number(params.id));
+route('POST', '/api/master/apps/:id/strike', 'master', async ({ params, body }) => {
+  const a = await db.get(`SELECT a.*, ad.display_name AS studio, ad.role AS role FROM apps a JOIN admins ad ON ad.id = a.admin_id WHERE a.id = ?`, [Number(params.id)]);
   if (!a) throw new HttpError(404, 'App not found');
   const reason = text(body.reason, 'Copyright reason', 3, 300);
   const takedown = body.takedown !== false;
+  await db.batch([
+    ['INSERT INTO strikes (app_id, app_name, admin_id, admin_name, reason, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+      [a.id, a.name, a.admin_id, a.studio, reason, now()]],
+    ["UPDATE apps SET strikes = strikes + 1, status = CASE WHEN ? THEN 'taken_down' ELSE status END, updated_at = ? WHERE id = ?",
+      [takedown ? 1 : 0, now(), a.id]],
+    ['UPDATE admins SET strikes = strikes + 1 WHERE id = ?', [a.admin_id]],
+  ]);
   let autoBanned = false;
-  db.exec('BEGIN');
-  try {
-    db.prepare('INSERT INTO strikes (app_id, app_name, admin_id, admin_name, reason, created_at) VALUES (?, ?, ?, ?, ?, ?)')
-      .run(a.id, a.name, a.admin_id, a.studio, reason, now());
-    db.prepare('UPDATE apps SET strikes = strikes + 1, status = CASE WHEN ? THEN \'taken_down\' ELSE status END, updated_at = ? WHERE id = ?')
-      .run(takedown ? 1 : 0, now(), a.id);
-    db.prepare('UPDATE admins SET strikes = strikes + 1 WHERE id = ?').run(a.admin_id);
-    const adm = db.prepare('SELECT strikes, status FROM admins WHERE id = ?').get(a.admin_id);
-    if (a.role !== 'master' && adm.strikes >= MAX_STRIKES && adm.status === 'active') {
-      banAdmin(a.admin_id, `Auto-ban: ${MAX_STRIKES} copyright strikes`);
-      autoBanned = true;
-    }
-    db.exec('COMMIT');
-  } catch (e) { db.exec('ROLLBACK'); throw e; }
+  const adm = await db.get('SELECT strikes, status FROM admins WHERE id = ?', [a.admin_id]);
+  if (a.role !== 'master' && adm.strikes >= MAX_STRIKES && adm.status === 'active') {
+    await banAdmin(a.admin_id, `Auto-ban: ${MAX_STRIKES} copyright strikes`);
+    autoBanned = true;
+  }
   return { ok: true, auto_banned: autoBanned };
 });
-route('GET', '/api/master/strikes', 'master', () => ({
-  strikes: db.prepare('SELECT * FROM strikes ORDER BY created_at DESC LIMIT 300').all(),
+route('GET', '/api/master/strikes', 'master', async () => ({
+  strikes: await db.all('SELECT * FROM strikes ORDER BY created_at DESC LIMIT 300'),
 }));
-route('POST', '/api/master/strikes/:id/revoke', 'master', ({ params }) => {
-  const s = db.prepare('SELECT * FROM strikes WHERE id = ?').get(Number(params.id));
+route('POST', '/api/master/strikes/:id/revoke', 'master', async ({ params }) => {
+  const s = await db.get('SELECT * FROM strikes WHERE id = ?', [Number(params.id)]);
   if (!s) throw new HttpError(404, 'Strike not found');
   if (s.revoked) throw new HttpError(400, 'Already revoked');
-  db.prepare('UPDATE strikes SET revoked = 1 WHERE id = ?').run(s.id);
-  db.prepare('UPDATE apps SET strikes = MAX(strikes - 1, 0) WHERE id = ?').run(s.app_id);
-  db.prepare('UPDATE admins SET strikes = MAX(strikes - 1, 0) WHERE id = ?').run(s.admin_id);
+  await db.batch([
+    ['UPDATE strikes SET revoked = 1 WHERE id = ?', [s.id]],
+    ['UPDATE apps SET strikes = MAX(strikes - 1, 0) WHERE id = ?', [s.app_id]],
+    ['UPDATE admins SET strikes = MAX(strikes - 1, 0) WHERE id = ?', [s.admin_id]],
+  ]);
   return { ok: true };
 });
 
-route('GET', '/api/master/ads', 'master', () => ({
-  ads: db.prepare('SELECT * FROM ads ORDER BY created_at DESC').all(),
+route('GET', '/api/master/ads', 'master', async () => ({
+  ads: await db.all('SELECT * FROM ads ORDER BY created_at DESC'),
 }));
-route('POST', '/api/master/ads', 'master', ({ body }) => {
+route('POST', '/api/master/ads', 'master', async ({ body }) => {
   const advertiser = text(body.advertiser, 'Advertiser', 2, 40);
   const title = text(body.title, 'Ad title', 2, 60);
   const image = String(body.image_url || '').trim() ? cleanUrl(body.image_url, 'Image link') : '';
   const link = cleanUrl(body.link_url, 'Ad link');
-  const r = db.prepare('INSERT INTO ads (advertiser, title, image_url, link_url, created_at) VALUES (?, ?, ?, ?, ?)')
-    .run(advertiser, title, image, link, now());
-  return { id: Number(r.lastInsertRowid) };
+  const r = await db.run('INSERT INTO ads (advertiser, title, image_url, link_url, created_at) VALUES (?, ?, ?, ?, ?)',
+    [advertiser, title, image, link, now()]);
+  return { id: r.lastId };
 });
-route('POST', '/api/master/ads/:id/status', 'master', ({ params, body }) => {
+route('POST', '/api/master/ads/:id/status', 'master', async ({ params, body }) => {
   const status = body.status === 'active' ? 'active' : 'paused';
-  const r = db.prepare('UPDATE ads SET status = ? WHERE id = ?').run(status, Number(params.id));
+  const r = await db.run('UPDATE ads SET status = ? WHERE id = ?', [status, Number(params.id)]);
   if (!r.changes) throw new HttpError(404, 'Ad not found');
   return { ok: true };
 });
-route('DELETE', '/api/master/ads/:id', 'master', ({ params }) => {
-  const r = db.prepare('DELETE FROM ads WHERE id = ?').run(Number(params.id));
+route('DELETE', '/api/master/ads/:id', 'master', async ({ params }) => {
+  const r = await db.run('DELETE FROM ads WHERE id = ?', [Number(params.id)]);
   if (!r.changes) throw new HttpError(404, 'Ad not found');
   return { ok: true };
 });
@@ -590,7 +677,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (!matched) throw new HttpError(404, 'Not found');
     if (method !== 'GET' && req.headers['x-requested-with'] !== 'OpenStore') throw new HttpError(403, 'Bad request origin');
-    const user = currentUser(req);
+    const user = await currentUser(req);
     if (matched.auth) {
       if (!user) throw new HttpError(401, 'Please log in');
       if (matched.auth === 'master' && user.role !== 'master') throw new HttpError(403, 'Master admin only');
@@ -617,17 +704,17 @@ const server = http.createServer(async (req, res) => {
 });
 
 /* ---------------------------------------------------------- master account */
-(function seedMaster() {
+async function seedMaster() {
   const envUser = process.env.MASTER_USER ? cleanUsername(process.env.MASTER_USER) : null;
   const envPass = process.env.MASTER_PASS || null;
   if (envPass && envPass.length < 8) { console.error('MASTER_PASS must be at least 8 characters'); process.exit(1); }
-  const m = db.prepare("SELECT * FROM admins WHERE role = 'master'").get();
+  const m = await db.get("SELECT * FROM admins WHERE role = 'master'");
   if (!m) {
     const username = envUser || 'master';
     const generated = !envPass;
     const pass = envPass || crypto.randomBytes(9).toString('base64url');
-    db.prepare(`INSERT INTO admins (username, display_name, password_hash, role, created_at) VALUES (?, 'Open Store', ?, 'master', ?)`)
-      .run(username, hashPassword(pass), now());
+    await db.run(`INSERT INTO admins (username, display_name, password_hash, role, created_at) VALUES (?, 'Open Store', ?, 'master', ?)`,
+      [username, hashPassword(pass), now()]);
     console.log('Master account created.');
     if (generated) {
       console.log('  No MASTER_PASS set, so a random one was made. Save it, then set MASTER_PASS in your host settings:');
@@ -635,10 +722,36 @@ const server = http.createServer(async (req, res) => {
     }
   } else if (envPass && (!verifyPassword(envPass, m.password_hash) || (envUser && envUser !== m.username))) {
     // MASTER_PASS / MASTER_USER changed in the host settings: apply them and log the master out
-    db.prepare('UPDATE admins SET password_hash = ?, username = ? WHERE id = ?').run(hashPassword(envPass), envUser || m.username, m.id);
-    db.prepare('DELETE FROM sessions WHERE admin_id = ?').run(m.id);
+    await db.batch([
+      ['UPDATE admins SET password_hash = ?, username = ? WHERE id = ?', [hashPassword(envPass), envUser || m.username, m.id]],
+      ['DELETE FROM sessions WHERE admin_id = ?', [m.id]],
+    ]);
     console.log('Master login updated from environment settings.');
   }
-})();
+}
 
-server.listen(PORT, '0.0.0.0', () => console.log(`Open Store running on port ${PORT}`));
+async function start() {
+  if (TURSO_URL) {
+    db = await openTurso(TURSO_URL, TURSO_TOKEN);
+    console.log('Database: Turso (online, data survives redeploys)');
+  } else {
+    db = openLocal(DB_PATH);
+    console.log(`Database: local file ${DB_PATH}`);
+    if (process.env.RENDER) {
+      console.warn('WARNING: running on Render with a local file. Data is wiped on every redeploy/restart.');
+      console.warn('         Set TURSO_DATABASE_URL and TURSO_AUTH_TOKEN in the Environment settings.');
+    }
+  }
+  await db.exec(SCHEMA);
+  await seedMaster();
+  setInterval(() => {
+    for (const [k, v] of attempts) if (v.reset < now()) attempts.delete(k);
+    db.run('DELETE FROM sessions WHERE expires_at < ?', [now()]).catch(() => {});
+  }, 10 * 60 * 1000).unref();
+  server.listen(PORT, '0.0.0.0', () => console.log(`Open Store running on port ${PORT}`));
+}
+
+start().catch((e) => {
+  console.error('Could not start Open Store:', e && e.message ? e.message : e);
+  process.exit(1);
+});
