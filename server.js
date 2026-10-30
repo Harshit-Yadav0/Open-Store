@@ -82,6 +82,17 @@ db.exec(`
     first_seen INTEGER NOT NULL,
     last_seen INTEGER NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS ads (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    advertiser TEXT NOT NULL,
+    title TEXT NOT NULL,
+    image_url TEXT NOT NULL DEFAULT '',
+    link_url TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    impressions INTEGER NOT NULL DEFAULT 0,
+    clicks INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL
+  );
 `);
 
 /* ----------------------------------------------------------------- helpers */
@@ -324,6 +335,23 @@ route('GET', '/go/:id', null, ({ req, res, params }) => {
   return { __redirect: cleanUrl(r.file_url, 'App file link') };
 });
 
+/* ---- ads (side billboards) */
+route('GET', '/api/ads', null, () => ({
+  ads: db.prepare("SELECT id, advertiser, title, image_url FROM ads WHERE status = 'active' ORDER BY RANDOM() LIMIT 6").all(),
+}));
+route('POST', '/api/ads/seen', null, ({ body }) => {
+  const ids = Array.isArray(body.ids) ? body.ids.slice(0, 6).map(Number).filter(Number.isInteger) : [];
+  const st = db.prepare("UPDATE ads SET impressions = impressions + 1 WHERE id = ? AND status = 'active'");
+  for (const id of ids) st.run(id);
+  return { ok: true };
+});
+route('GET', '/ad/:id', null, ({ params }) => {
+  const a = db.prepare("SELECT * FROM ads WHERE id = ? AND status = 'active'").get(Number(params.id));
+  if (!a) throw new HttpError(404, 'Ad not available');
+  db.prepare('UPDATE ads SET clicks = clicks + 1 WHERE id = ?').run(a.id);
+  return { __redirect: cleanUrl(a.link_url, 'Ad link') };
+});
+
 /* ---- login */
 route('POST', '/api/login', null, async ({ req, res, body }) => {
   const username = String(body.username || '').trim().toLowerCase().slice(0, 40);
@@ -497,6 +525,30 @@ route('POST', '/api/master/strikes/:id/revoke', 'master', ({ params }) => {
   return { ok: true };
 });
 
+route('GET', '/api/master/ads', 'master', () => ({
+  ads: db.prepare('SELECT * FROM ads ORDER BY created_at DESC').all(),
+}));
+route('POST', '/api/master/ads', 'master', ({ body }) => {
+  const advertiser = text(body.advertiser, 'Advertiser', 2, 40);
+  const title = text(body.title, 'Ad title', 2, 60);
+  const image = String(body.image_url || '').trim() ? cleanUrl(body.image_url, 'Image link') : '';
+  const link = cleanUrl(body.link_url, 'Ad link');
+  const r = db.prepare('INSERT INTO ads (advertiser, title, image_url, link_url, created_at) VALUES (?, ?, ?, ?, ?)')
+    .run(advertiser, title, image, link, now());
+  return { id: Number(r.lastInsertRowid) };
+});
+route('POST', '/api/master/ads/:id/status', 'master', ({ params, body }) => {
+  const status = body.status === 'active' ? 'active' : 'paused';
+  const r = db.prepare('UPDATE ads SET status = ? WHERE id = ?').run(status, Number(params.id));
+  if (!r.changes) throw new HttpError(404, 'Ad not found');
+  return { ok: true };
+});
+route('DELETE', '/api/master/ads/:id', 'master', ({ params }) => {
+  const r = db.prepare('DELETE FROM ads WHERE id = ?').run(Number(params.id));
+  if (!r.changes) throw new HttpError(404, 'Ad not found');
+  return { ok: true };
+});
+
 /* ------------------------------------------------------------- static files */
 const MIME = {
   '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
@@ -524,7 +576,7 @@ function serveStatic(req, res, pathname) {
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, 'http://localhost');
-    const isApi = url.pathname.startsWith('/api/') || url.pathname.startsWith('/go/');
+    const isApi = url.pathname.startsWith('/api/') || url.pathname.startsWith('/go/') || url.pathname.startsWith('/ad/');
     if (!isApi) {
       if (req.method !== 'GET' && req.method !== 'HEAD') throw new HttpError(405, 'Method not allowed');
       return serveStatic(req, res, url.pathname);
@@ -556,7 +608,7 @@ const server = http.createServer(async (req, res) => {
     if (!(e instanceof HttpError)) console.error(e);
     const status = e instanceof HttpError ? e.status : 500;
     const message = e instanceof HttpError ? e.message : 'Server error';
-    if (req.url.startsWith('/go/')) {
+    if (req.url.startsWith('/go/') || req.url.startsWith('/ad/')) {
       res.writeHead(status, { 'Content-Type': 'text/plain; charset=utf-8', ...securityHeaders() });
       return res.end(message);
     }
