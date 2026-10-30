@@ -340,3 +340,43 @@ td.num, th.num { text-align: right; font-family: var(--mono); font-variant-numer
   .card, .btn, button { transition: none; }
   .card:hover { transform: none; }
 }
+
+/* ---- side billboards (sponsored panels) */
+.rail, .adstrip { display: none; }
+.ad {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  color: var(--text);
+  opacity: 0.92;
+  transition: border-color 0.2s, opacity 0.2s;
+}
+.ad:visited { color: var(--text); }
+.ad:hover { border-color: var(--line-hot); opacity: 1; text-decoration: none; }
+.adlabel { font-family: var(--mono); font-size: 9px; letter-spacing: 0.22em; text-transform: uppercase; color: var(--dim); }
+.adart {
+  display: flex; align-items: center; justify-content: center;
+  aspect-ratio: 4 / 5;
+  width: 100%;
+  overflow: hidden;
+  background: linear-gradient(160deg, #0f1b36, #0a1224);
+  border: 1px solid var(--line);
+}
+.adart img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.adtxt { font-family: var(--mono); font-size: 13px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--dim); padding: 8px; text-align: center; overflow-wrap: anywhere; }
+.adtitle { font-size: 13px; line-height: 1.35; overflow-wrap: anywhere; }
+@media (min-width: 1400px) {
+  .rail { display: flex; flex-direction: column; gap: 16px; position: fixed; top: 96px; width: 170px; z-index: 5; }
+  .rail.left { left: calc(50% - 500px - 190px); }
+  .rail.right { right: calc(50% - 500px - 190px); }
+}
+@media (max-width: 1399.98px) {
+  .adstrip { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; margin-top: 8px; }
+  .adstrip:empty { display: none; }
+  .adstrip .adart { aspect-ratio: 16 / 7; }
+}
+@media (prefers-reduced-motion: reduce) { .ad { transition: none; } }
